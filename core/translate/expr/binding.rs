@@ -98,6 +98,14 @@ pub fn bind_and_rewrite_expr<'a>(
                         .any(|name| name.eq_ignore_ascii_case(&normalized_id));
                     let has_declared_column = is_rowid_name
                         && joined_tables.iter().try_fold(false, |found, table| {
+                            if found
+                                && table
+                                    .join_info
+                                    .as_ref()
+                                    .is_some_and(|join| join.merges_column(&normalized_id))
+                            {
+                                return Ok(true);
+                            }
                             Ok::<_, LimboError>(
                                 find_unqualified_column_with_rowid(
                                     &table.table,

@@ -1825,3 +1825,21 @@ expect {
     2|base|base|other
     2|base|base|other
 }
+
+@cross-check-integrity
+test outer-using-prefers-declared-rowid-names-over-a-join-group {
+    CREATE TABLE a(rowid, _rowid_, oid);
+    CREATE TABLE b(rowid, _rowid_, oid);
+    CREATE TABLE c(rowid, _rowid_, oid);
+    INSERT INTO a VALUES(2,20,200);
+    INSERT INTO b VALUES(2,20,200);
+    INSERT INTO c VALUES(2,20,200);
+    SELECT rowid, _rowid_, oid FROM a
+      JOIN (b JOIN c ON b.rowid=c.rowid) USING(rowid,_rowid_,oid);
+    SELECT rowid, _rowid_, oid FROM a
+      NATURAL JOIN (b JOIN c ON b.rowid=c.rowid);
+}
+expect {
+    2|20|200
+    2|20|200
+}
