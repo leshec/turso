@@ -3,7 +3,7 @@ use crate::{turso_assert, turso_assert_greater_than_or_equal};
 
 use super::plan::NamedWindowBound;
 use super::{
-    expr::{walk_expr, walk_expr_mut},
+    expr::{find_unqualified_column, walk_expr, walk_expr_mut},
     plan::{
         query_output_columns, Aggregate, ColumnMask, ColumnUsedMask, Distinctness, EvalAt,
         IterationDirection, JoinInfo, JoinOrderMember, JoinType as PlanJoinType, JoinedTable,
@@ -1775,7 +1775,7 @@ fn keep_parenthesized_join_columns(table: &mut JoinedTable) -> Result<()> {
         for using_name in next_using {
             let column_name = using_name.as_str();
             let (expr, source_columns) =
-                resolve_parenthesized_using_column(source_tables, table_index, column_name);
+                resolve_parenthesized_using_column(source_tables, table_index, column_name)?;
             used_columns.extend(source_columns);
             result_columns.push(parenthesized_join_result_column(expr, column_name));
             join_columns.push(ParenthesizedJoinColumn {
@@ -1977,13 +1977,33 @@ fn resolve_parenthesized_using_column(
     tables: &[JoinedTable],
     last_table_index: usize,
     column_name: &str,
-) -> (Expr, Vec<(TableInternalId, usize)>) {
+) -> Result<(Expr, Vec<(TableInternalId, usize)>)> {
     let mut expr = None;
     let mut used_columns = Vec::new();
-    for table in tables.iter().take(last_table_index + 2) {
-        let Some((column_index, column)) = table.table.get_column_by_name(column_name) else {
+    for (table_index, table) in tables.iter().enumerate() {
+        let merges_column = table
+            .join_info
+            .as_ref()
+            .is_some_and(|join| join.merges_column(column_name));
+        if expr.is_some()
+            && merges_column
+            && !table
+                .join_info
+                .as_ref()
+                .is_some_and(JoinInfo::is_full_outer)
+        {
+            continue;
+        }
+        let Some(column_index) = find_unqualified_column(&table.table, column_name)? else {
             continue;
         };
+        let column = &table.columns()[column_index];
+        if expr.is_some() && !merges_column {
+            crate::bail_parse_error!("ambiguous column name: {}", column_name);
+        }
+        if table_index > last_table_index + 1 {
+            continue;
+        }
         let source = Expr::Column {
             database: None,
             table: table.internal_id,
@@ -1995,7 +2015,7 @@ fn resolve_parenthesized_using_column(
         } else if table
             .join_info
             .as_ref()
-            .is_some_and(|join| join.is_full_outer() && join.merges_column(column_name))
+            .is_some_and(JoinInfo::is_full_outer)
         {
             expr = Some(Expr::FunctionCall {
                 name: ast::Name::exact("coalesce".to_string()),
@@ -2013,10 +2033,10 @@ fn resolve_parenthesized_using_column(
         }
         used_columns.push((table.internal_id, column_index));
     }
-    (
+    Ok((
         expr.expect("USING already proved that the column exists"),
         used_columns,
-    )
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]

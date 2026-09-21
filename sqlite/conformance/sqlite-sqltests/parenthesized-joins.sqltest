@@ -1697,3 +1697,57 @@ expect {
     9|2|b|left-two|right-two
     9|3|c||right-three
 }
+
+@cross-check-integrity
+test outer-using-chooses-the-left-column-before-checking-a-group {
+    CREATE TABLE a(x);
+    CREATE TABLE b(x);
+    CREATE TABLE c(x);
+    INSERT INTO a VALUES(2);
+    INSERT INTO b VALUES(2);
+    INSERT INTO c VALUES(2);
+    SELECT x FROM a JOIN (b JOIN c ON b.x=c.x) USING(x);
+    SELECT x FROM a LEFT JOIN (b JOIN c ON b.x=c.x) USING(x);
+    SELECT x FROM a NATURAL JOIN (b JOIN c ON b.x=c.x);
+}
+expect {
+    2
+    2
+    2
+}
+
+@cross-check-integrity
+test parenthesized-using-rejects-a-later-unmerged-name {
+    CREATE TABLE b(x, y);
+    CREATE TABLE c(x, z);
+    CREATE TABLE d(x, w);
+    SELECT d.w FROM (SELECT 1 AS marker) AS anchor
+      JOIN (b JOIN c USING(x) JOIN d ON true) AS grouped ON true;
+}
+expect error {
+    ambiguous column name: x
+}
+
+@cross-check-integrity
+test parenthesized-using-rejects-an-earlier-unmerged-name {
+    CREATE TABLE b(x, y);
+    CREATE TABLE c(x, z);
+    CREATE TABLE d(x, w);
+    SELECT d.w FROM (SELECT 1 AS marker) AS anchor
+      JOIN (b JOIN c ON b.x=c.x JOIN d USING(x)) AS grouped ON true;
+}
+expect error {
+    ambiguous column name: x
+}
+
+@cross-check-integrity
+test nested-using-rejects-a-group-with-two-unmerged-names {
+    CREATE TABLE b(x, y);
+    CREATE TABLE c(x, z);
+    CREATE TABLE d(x, w);
+    SELECT d.w FROM (SELECT 1 AS marker) AS anchor
+      JOIN ((b JOIN c ON b.x=c.x) AS inner_group JOIN d USING(x)) AS outer_group ON true;
+}
+expect error {
+    ambiguous column name: x
+}

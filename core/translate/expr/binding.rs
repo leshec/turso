@@ -109,6 +109,14 @@ pub fn bind_and_rewrite_expr<'a>(
                             )
                         })?;
                     for joined_table in joined_tables.iter() {
+                        if match_result.is_some()
+                            && joined_table
+                                .join_info
+                                .as_ref()
+                                .is_some_and(|join| join.merges_column(&normalized_id))
+                        {
+                            continue;
+                        }
                         let col_idx = find_unqualified_column_with_rowid(
                             &joined_table.table,
                             &normalized_id,
