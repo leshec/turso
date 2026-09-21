@@ -501,6 +501,7 @@ fn prepare_one_select_plan(
                                 &mut plan.table_references,
                                 &mut plan.result_columns,
                                 long_names,
+                                resolver,
                             )?;
                         }
                         ResultColumn::TableStar(name) => {

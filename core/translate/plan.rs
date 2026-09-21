@@ -7,7 +7,7 @@ use crate::{
     },
     translate::{
         collate::{get_collseq_from_expr, CollationSeq},
-        emitter::UpdateRowSource,
+        emitter::{Resolver, UpdateRowSource},
         expr::{
             as_binary_components, expr_data_type, find_unqualified_column, get_expr_affinity,
             StorageClassMask,
@@ -1013,6 +1013,7 @@ pub(super) fn expand_star(
     table_references: &mut TableReferences,
     out_columns: &mut Vec<ResultSetColumn>,
     long_names: bool,
+    resolver: &Resolver<'_>,
 ) -> crate::Result<()> {
     let tables = table_references.joined_tables();
     // RIGHT JOIN swapped tables; iterate in reverse to restore original column order.
@@ -1083,21 +1084,53 @@ pub(super) fn expand_star(
                 }
             }
         }
-        out_columns.extend(
-            table
-                .columns_for_star()
-                .filter(|(_, column)| {
-                    // If we are joining with USING, we need to deduplicate the columns from the right table
-                    // that are also present in the USING clause.
-                    !table.join_info.as_ref().is_some_and(|join| {
-                        column
-                            .name
-                            .as_deref()
-                            .is_some_and(|name| join.merges_column(name))
-                    })
-                })
-                .map(|(column_index, _)| star_result_column(table, column_index, long_names)),
-        );
+        for (column_index, column) in table.columns_for_star() {
+            if table.join_info.as_ref().is_some_and(|join| {
+                column
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| join.merges_column(name))
+            }) {
+                continue;
+            }
+            if let Some(column_name) = column.name.as_deref() {
+                if !matches!(
+                    &table.table,
+                    Table::FromClauseSubquery(subquery)
+                        if subquery.parenthesized_join_columns.is_some()
+                ) && parenthesized_join_has_matching_source(tables, table, column_name)
+                {
+                    if matches!(&table.table, Table::BTree(_) | Table::Virtual(_)) {
+                        let database_name = resolver
+                            .get_database_name_by_index(table.database_id)
+                            .expect("the table database must exist while compiling a query");
+                        crate::bail_parse_error!(
+                            "ambiguous column name: {}.{}.{}",
+                            database_name,
+                            table.identifier,
+                            column_name
+                        );
+                    }
+                    crate::bail_parse_error!(
+                        "ambiguous column name: {}.{}",
+                        table.identifier,
+                        column_name
+                    );
+                }
+            }
+            let column_index = if tables.len() == 1
+                && column.name.is_some()
+                && matches!(
+                    &table.table,
+                    Table::FromClauseSubquery(subquery)
+                        if subquery.parenthesized_join_columns.is_some()
+                ) {
+                rebind_parenthesized_star_column(table, column_index)?
+            } else {
+                column_index
+            };
+            out_columns.push(star_result_column(table, column_index, long_names));
+        }
     }
     for table in table_references.joined_tables_mut() {
         for column_index in 0..table.columns().len() {
@@ -1140,31 +1173,13 @@ pub(super) fn expand_table_star(
         crate::bail_parse_error!("ambiguous column name: {}.{}", table_name, column_name);
     }
 
-    let saved_name_has_column = |column_name: &str| {
-        tables.iter().any(|table| {
-            matches!(
-                &table.table,
-                Table::FromClauseSubquery(subquery)
-                    if subquery.parenthesized_join_columns.as_ref().is_some_and(|columns| {
-                        columns.iter().any(|column| {
-                            !column.source.is_rowid()
-                                && column.source.matches_table(None, &normalized_name)
-                                && column.source.matches_column_name(column_name)
-                        }) && !tables.iter()
-                            .filter(|candidate| candidate.internal_id == table.internal_id || is_direct_match(candidate))
-                            .next_back()
-                            .is_some_and(|last| last.join_info.as_ref().is_some_and(|join| join.merges_column(column_name)))
-                    })
-            )
-        })
-    };
     // SQLite binds each column after it expands `<table>.*`. A direct table
     // and a saved inner name conflict only when both contain that column.
     if let Some(column_name) = first_direct_match.and_then(|table| {
         table
             .columns_for_star()
             .filter_map(|(_, column)| column.name.as_deref())
-            .find(|column_name| saved_name_has_column(column_name))
+            .find(|column_name| parenthesized_join_has_matching_source(tables, table, column_name))
     }) {
         crate::bail_parse_error!("ambiguous column name: {}.{}", table_name, column_name);
     }
@@ -1216,14 +1231,7 @@ pub(super) fn expand_table_star(
         {
             // SQLite emits a bare generated name in this case. Rebinding that
             // name can find several sources, or none after a numeric suffix.
-            let column_name = table.columns()[column_index]
-                .name
-                .as_deref()
-                .expect("the nameless-column check returned early");
-            let Some(rebound_column) = find_unqualified_column(&table.table, column_name)? else {
-                crate::bail_parse_error!("no such column: {}", column_name);
-            };
-            column_index = rebound_column;
+            column_index = rebind_parenthesized_star_column(table, column_index)?;
         }
         out_columns.push(star_result_column(table, column_index, long_names));
         used_columns.push((table.internal_id, column_index));
@@ -1232,6 +1240,49 @@ pub(super) fn expand_table_star(
         table_references.mark_column_used(table_id, column_index);
     }
     Ok(())
+}
+
+fn parenthesized_join_has_matching_source(
+    tables: &[JoinedTable],
+    direct_table: &JoinedTable,
+    column_name: &str,
+) -> bool {
+    let database_id = matches!(&direct_table.table, Table::BTree(_) | Table::Virtual(_))
+        .then_some(direct_table.database_id);
+    tables.iter().any(|table| {
+        matches!(
+            &table.table,
+            Table::FromClauseSubquery(subquery)
+                if subquery.parenthesized_join_columns.as_ref().is_some_and(|columns| {
+                    columns.iter().any(|column| {
+                        !column.source.is_rowid()
+                            && column.source.matches_table(database_id, &direct_table.identifier)
+                            && column.source.matches_column_name(column_name)
+                    }) && !tables.iter()
+                        .filter(|candidate| {
+                            candidate.internal_id == table.internal_id
+                                || candidate.internal_id == direct_table.internal_id
+                        })
+                        .next_back()
+                        .is_some_and(|last| {
+                            last.join_info
+                                .as_ref()
+                                .is_some_and(|join| join.merges_column(column_name))
+                        })
+                })
+        )
+    })
+}
+
+fn rebind_parenthesized_star_column(table: &JoinedTable, column_index: usize) -> Result<usize> {
+    let column_name = table.columns()[column_index]
+        .name
+        .as_deref()
+        .expect("the star column must have a name");
+    let Some(column_index) = find_unqualified_column(&table.table, column_name)? else {
+        crate::bail_parse_error!("no such column: {}", column_name);
+    };
+    Ok(column_index)
 }
 
 /// Build one result column from a star expansion.

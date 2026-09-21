@@ -1751,3 +1751,77 @@ test nested-using-rejects-a-group-with-two-unmerged-names {
 expect error {
     ambiguous column name: x
 }
+
+@cross-check-integrity
+test bare-star-rejects-duplicate-names-in-one-aliased-group {
+    CREATE TABLE b(x, y);
+    CREATE TABLE c(x, z);
+    SELECT * FROM (b JOIN c ON b.x=c.x) AS grouped;
+}
+expect error {
+    ambiguous column name: x
+}
+
+@cross-check-integrity
+test bare-star-rejects-a-direct-and-inner-table-name-collision {
+    CREATE TABLE b(x, y);
+    CREATE TABLE c(x, z);
+    SELECT * FROM b JOIN (b JOIN c USING(x)) USING(x);
+}
+expect error {
+    ambiguous column name: main.b.y
+}
+
+@cross-check-integrity
+test bare-star-rejects-a-direct-and-inner-name-without-using {
+    CREATE TABLE b(x, y);
+    CREATE TABLE c(x, z);
+    SELECT * FROM b JOIN (b JOIN c USING(x)) ON true;
+}
+expect error {
+    ambiguous column name: main.b.x
+}
+
+@cross-check-integrity
+test star-keeps-main-and-temp-source-names-separate {
+    CREATE TABLE b(x, y);
+    CREATE TEMP TABLE b(x, y);
+    CREATE TABLE c(x, z);
+    INSERT INTO main.b VALUES(2,'main');
+    INSERT INTO temp.b VALUES(2,'temp');
+    INSERT INTO c VALUES(2,'c');
+    SELECT b.* FROM main.b JOIN (temp.b JOIN c USING(x)) USING(x);
+    SELECT b.* FROM temp.b JOIN (main.b JOIN c USING(x)) USING(x);
+    SELECT * FROM main.b JOIN (temp.b JOIN c USING(x)) USING(x);
+}
+expect {
+    2|main|2|temp
+    2|temp|2|main
+    2|main|temp|c
+}
+
+@cross-check-integrity
+test bare-star-rejects-a-direct-and-inner-view-name-collision {
+    CREATE TABLE base(x, y);
+    CREATE TABLE other(x, z);
+    CREATE VIEW v AS SELECT * FROM base;
+    SELECT * FROM v JOIN (v JOIN other USING(x)) USING(x);
+}
+expect error {
+    ambiguous column name:
+}
+
+@cross-check-integrity
+test bare-star-keeps-distinct-view-aliases {
+    CREATE TABLE base(x, y);
+    CREATE TABLE other(x, z);
+    CREATE VIEW v AS SELECT * FROM base;
+    INSERT INTO base VALUES(2,'base');
+    INSERT INTO other VALUES(2,'other');
+    SELECT * FROM v AS outer_v JOIN (v JOIN other USING(x)) USING(x);
+    SELECT * FROM v JOIN (v AS inner_v JOIN other USING(x)) USING(x);
+}
+expect {
+    2|base|base|other
+    2|base|base|other
+}
